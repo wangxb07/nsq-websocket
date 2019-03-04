@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"github.com/gorilla/websocket"
@@ -12,6 +13,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -79,6 +81,8 @@ func wsNsq(w http.ResponseWriter, r *http.Request) {
 		log.Print("upgrade:", err)
 		return
 	}
+	defer c.Close()
+	defer ticker.Stop()
 
 	go func() {
 		for {
@@ -91,8 +95,6 @@ func wsNsq(w http.ResponseWriter, r *http.Request) {
 			msg <-message
 		}
 	}()
-
-	defer c.Close()
 
 	for {
 		// TODO nsq message receive and write to socket request
@@ -111,27 +113,17 @@ func wsNsq(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-interrupt:
-			err := c.WriteMessage(websocket.CloseMessage, []byte("Close..."))
-			if err != nil {
-				log.Println("write:", err)
-				return
-			}
 			ticker.Stop()
+			log.Println("Close...")
 			return
 		}
 	}
 }
 
-func initNsqConn() {
+func startNsqConn() []*nsq.Consumer {
 	cfg := nsq.NewConfig()
 
 	//flag.Var(&nsq.ConfigFlag{cfg}, "consumer-opt", "option to passthrough to nsq.Consumer (may be given multiple times, http://godoc.org/github.com/nsqio/go-nsq#Config)")
-	flag.Parse()
-
-	if *showVersion {
-		fmt.Printf("nsq_websocket v%s\n", "1.1.1-alpha")
-		return
-	}
 
 	if *channel == "" {
 		rand.Seed(time.Now().UnixNano())
@@ -156,7 +148,7 @@ func initNsqConn() {
 	cfg.UserAgent = fmt.Sprintf("nsq_websocket/%s go-nsq/%s", "1.1.1-alpha", nsq.VERSION)
 	cfg.MaxInFlight = *maxInFlight
 
-	consumers := []*nsq.Consumer{}
+	var consumers []*nsq.Consumer
 	for i := 0; i < len(topics); i += 1 {
 		log.Printf("Adding consumer for topic: %s\n", topics[i])
 
@@ -180,39 +172,65 @@ func initNsqConn() {
 		consumers = append(consumers, consumer)
 	}
 
-	go func() {
-		for {
-			select {
-			case <-interrupt:
-				log.Println("interrupt and clear consumers")
-				for _, consumer := range consumers {
-					consumer.Stop()
-				}
-				for _, consumer := range consumers {
-					<-consumer.StopChan
-				}
-
-				return
-			}
-		}
-	}()
+	return consumers
 }
 
 func home(w http.ResponseWriter, r *http.Request) {
 	homeTemplate.Execute(w, "ws://"+r.Host+"/nsq")
 }
 
-func main() {
-	log.SetFlags(log.Ldate|log.Lshortfile)
-
-	signal.Notify(interrupt, os.Interrupt, os.Kill)
-
-	initNsqConn()
+func startHttpServer() *http.Server {
+	srv := &http.Server{Addr: *addr}
 
 	http.HandleFunc("/nsq", wsNsq)
 	http.HandleFunc("/", home)
 
-	log.Fatal(http.ListenAndServe(*addr, nil))
+	go func() {
+		// returns ErrServerClosed on graceful close
+		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+			// NOTE: there is a chance that next line won't have time to run,
+			// as main() doesn't wait for this goroutine to stop. don't use
+			// code with race conditions like these for production. see post
+			// comments below on more discussion on how to handle this.
+			log.Fatalf("ListenAndServe(): %s", err)
+		}
+	}()
+
+	// returning reference so caller can call Shutdown()
+	return srv
+}
+
+func main() {
+	log.SetFlags(log.Ldate|log.Lshortfile)
+	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("nsq_websocket v%s\n", "1.1.1-alpha")
+		return
+	}
+
+	signal.Notify(interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	consumers := startNsqConn()
+	srv := startHttpServer()
+
+	<-interrupt
+
+	log.Println("Clear consumers")
+	for _, consumer := range consumers {
+		consumer.Stop()
+	}
+	for _, consumer := range consumers {
+		<-consumer.StopChan
+	}
+
+	log.Printf("main: stopping HTTP server")
+	// now close the server gracefully ("shutdown")
+	// timeout could be given with a proper context (in real world you shouldn't use TODO() ).
+	if err := srv.Shutdown(context.TODO()); err != nil {
+		panic(err) // failure/timeout shutting down the server gracefully
+	}
+	log.Printf("main: done. exiting")
 }
 
 var homeTemplate = template.Must(template.New("").Parse(`
