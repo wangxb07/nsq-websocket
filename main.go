@@ -38,6 +38,9 @@ var (
 	maxInFlight   = flag.Int("max-in-flight", 200, "max number of messages to allow in flight")
 	totalMessages = flag.Int("n", 0, "total messages to show (will wait if starved)")
 
+	certFile = flag.String("cert-file", "", "the certificate file path")
+	keyFile = flag.String("key-file", "", "the private file path")
+
 	nsqdTCPAddrs     = StringArray{}
 	lookupdHTTPAddrs = StringArray{}
 	topics           = StringArray{}
@@ -187,12 +190,18 @@ func startHttpServer() *http.Server {
 
 	go func() {
 		// returns ErrServerClosed on graceful close
-		if err := srv.ListenAndServe(); err != http.ErrServerClosed {
-			// NOTE: there is a chance that next line won't have time to run,
-			// as main() doesn't wait for this goroutine to stop. don't use
-			// code with race conditions like these for production. see post
-			// comments below on more discussion on how to handle this.
-			log.Fatalf("ListenAndServe(): %s", err)
+		if len(*certFile) == 0 && len(*keyFile) == 0 {
+			if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+				// NOTE: there is a chance that next line won't have time to run,
+				// as main() doesn't wait for this goroutine to stop. don't use
+				// code with race conditions like these for production. see post
+				// comments below on more discussion on how to handle this.
+				log.Fatalf("ListenAndServe(): %s", err)
+			}
+		} else {
+			if err := srv.ListenAndServeTLS(*certFile, *keyFile); err != http.ErrServerClosed {
+				log.Fatalf("ListenAndServeTLS(): %s", err)
+			}
 		}
 	}()
 
